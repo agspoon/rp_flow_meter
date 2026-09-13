@@ -1,0 +1,394 @@
+# BLE to MQTT proxy for RainPoint HCS048B Wireless Water Flow Meter
+# 
+# No BLE connection required, as this gets all the information required via
+# BLE Advertisement packets.
+#
+# Fully generic config: no per-meter YAML required for the raw MQTT/Prometheus
+# path. Any device whose BLE MAC starts with `meter_mac_prefix` and advertises
+# the expected custom service UUID is treated as a meter -- parsed, and
+# published via MQTT to topic "flowmeter/XXYY" (XXYY = last two bytes of the
+# meter's MAC) as a single flat JSON payload, e.g. {"total_today":249.56,
+# "total_usage":1214.00,"last_session_usage":1.64,"rssi":-72,"flow_rate":0.42}.
+# This matches mqtt-exporter's native topic+JSON convention with zero custom
+# exporter config needed.
+#
+# Publishes on every plausible advertisement (roughly ~1Hz per meter); see the
+# rate-averaging comments in the lambda below for why flow_rate specifically
+# is smoothed over a longer window rather than computed per-advertisement.
+#
+# Separately, a small number of *declared* sensor: entities further down
+# (search "Home Assistant") mirror this same data for the two known meters
+# specifically, so it also shows up automatically via Home Assistant's MQTT
+# discovery -- see the comment block above that section for how that works
+# and how to extend it to your own meters.
+#
+# IMPORTANT: change `node_name` below before compiling for the second board
+# (WiFi hostname / mDNS / MQTT client ID all derive from it).
+substitutions:
+  node_name: flowmeter-node2        # this board -- change back to flowmeter-node1 if reused for the first board
+  meter_mac_prefix: "DC:23:53:62"   # shared OUI/prefix across this meter product line
+  meter_service_uuid: "0x011b9191"  # custom 32-bit service UUID carrying meter data
+
+esphome:
+  name: ${node_name}
+  includes:
+    - meter_state.h
+
+esp32:
+  board: adafruit_feather_esp32s3_nopsram   # Adafruit ESP32-S3 Feather 8MB w.FL (replacement
+                                              # for the Stamp-S3A -- same 8MB flash, no PSRAM)
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    then:
+      - light.turn_on:
+          id: status_led
+          red: 0%
+          green: 100%
+          blue: 0%
+          brightness: 25%
+          transition_length: 0s
+  on_disconnect:
+    then:
+      - light.turn_on:
+          id: status_led
+          red: 100%
+          green: 0%
+          blue: 0%
+          brightness: 25%
+          transition_length: 0s
+
+# Onboard NeoPixel status LED (GPIO33), gated by its own power-enable pin
+# (GPIO21) -- both pin numbers confirmed from the board's own Arduino variant
+# definition, not guessed. Power pin must be driven high or the LED does
+# nothing at all, regardless of what the light component itself is told.
+# Dedicated to WiFi status (red/green) only -- see the plain red LED below
+# for MQTT activity, so this one never needs to save/restore its color.
+switch:
+  - platform: gpio
+    pin: GPIO21
+    id: neopixel_power
+    restore_mode: ALWAYS_ON
+    internal: true
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO33
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+    internal: true
+    default_transition_length: 0s
+
+  # Second, separate onboard LED -- plain red, non-addressable, on GPIO13
+  # (labeled "#13" on the board, exposed as LED_BUILTIN in Arduino; this is
+  # the same LED the bootloader itself blinks during flashing). Using ledc
+  # (PWM) rather than a plain digital output so brightness control works
+  # the same way as the NeoPixel.
+  - platform: monochromatic
+    output: mqtt_led_output
+    id: mqtt_led
+    internal: true
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+
+output:
+  - platform: ledc
+    pin: GPIO13
+    id: mqtt_led_output
+
+# Brief flash of the plain red LED on every flow-data MQTT publish, then
+# automatically restores its previous (off) state -- flash_length on
+# light.turn_on handles the save/restore itself, no manual state tracking
+# needed. (Note: there's no separate "light.flash" action -- flash_length is
+# just a parameter of light.turn_on.)
+script:
+  - id: flash_mqtt_activity
+    then:
+      - light.turn_on:
+          id: mqtt_led
+          brightness: 50%
+          flash_length: 150ms
+
+mqtt:
+  id: mqtt_client
+  broker: !secret mqtt_broker
+  topic_prefix: ${node_name}   # still used for this node's own availability/birth-will topics;
+                                 # meter data topics below are published as raw absolute topics,
+                                 # not under this prefix, per the "XXYY-sensor_name" pattern.
+
+# --- Home Assistant path ---
+# The raw JSON publishes above are enough for mqtt-exporter/Prometheus/Grafana
+# on their own, and stay completely unaffected by this section. This part is
+# *additive*: declared sensor: entities, one set per known meter, feeding the
+# exact same computed numbers to Home Assistant too. ESPHome's mqtt: component
+# (already configured above) publishes HA-compatible MQTT discovery messages
+# automatically for any entity declared here with a real `name:` -- no api:
+# component needed, and nothing for a Home Assistant user to configure by
+# hand; the entities just appear once this device is flashed.
+#
+# Unlike the raw JSON side, this part is NOT automatically generic -- each
+# meter needs its five sensors declared here, plus a small block in the
+# lambda below (search for "Home Assistant" again) that routes decoded
+# values to the right meter's entities based on its MAC suffix. FY and BY
+# are populated below as the two currently-known meters.
+#
+# TO ADD YOUR OWN METER TO THIS SECTION:
+#   1. First find out whether your meter is even compatible with the raw
+#      scanning logic at all -- it needs to share the same manufacturer/
+#      protocol as FY and BY (i.e. match `meter_mac_prefix` and
+#      `meter_service_uuid` above). If it does, the raw JSON side of this
+#      config already publishes for it automatically, with zero changes,
+#      under a topic named after its own MAC suffix -- you just don't know
+#      that suffix yet. (If your meter is a different make or protocol
+#      entirely, this whole config's byte-level parsing was reverse
+#      engineered for this one specific product, and adapting it is a
+#      bigger undertaking than this comment block -- outside what's covered
+#      here.)
+#   2. To find your meter's suffix WITHOUT touching BLE at all: this ESP32
+#      is already broadcasting it in plain MQTT. Capture your WiFi traffic
+#      with Wireshark (or a saved capture file) and use the display filter:
+#          mqtt.msgtype == 3 and mqtt.topic contains "flowmeter/"
+#      Every matching packet's Topic column shows something like
+#      "flowmeter/A1B2" -- that "A1B2" is your meter's suffix (the last two
+#      bytes of its BLE MAC), ready to use below. If you have several
+#      meters and aren't sure which topic is which, watch which one changes
+#      while you run water at that specific meter.
+#   3. Copy one of the five-sensor blocks below (e.g. the FY block), rename
+#      the `id:` values (fy_* -> something meaningful for your meter) and
+#      the `name:` strings.
+#   4. Copy the matching "if (suffix == "7E31")" block further down in the
+#      lambda (search "Home Assistant"), swap in your new suffix string and
+#      sensor ids.
+sensor:
+  # --- FY (front yard) meter, MAC suffix 7E31 ---
+  - platform: template
+    name: "FY Total Today"
+    id: fy_total_today
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+    state_class: total_increasing
+  - platform: template
+    name: "FY Total Usage"
+    id: fy_total_usage
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+    state_class: total_increasing
+  - platform: template
+    name: "FY Last Session Usage"
+    id: fy_last_session_usage
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+  - platform: template
+    name: "FY Flow Rate"
+    id: fy_flow_rate
+    unit_of_measurement: "gal/min"
+    accuracy_decimals: 3
+    state_class: measurement
+  - platform: template
+    name: "FY Meter RSSI"
+    id: fy_rssi
+    unit_of_measurement: "dBm"
+    accuracy_decimals: 0
+    device_class: signal_strength
+    entity_category: diagnostic
+
+  # --- BY (back yard) meter, MAC suffix 855E ---
+  - platform: template
+    name: "BY Total Today"
+    id: by_total_today
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+    state_class: total_increasing
+  - platform: template
+    name: "BY Total Usage"
+    id: by_total_usage
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+    state_class: total_increasing
+  - platform: template
+    name: "BY Last Session Usage"
+    id: by_last_session_usage
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+  - platform: template
+    name: "BY Flow Rate"
+    id: by_flow_rate
+    unit_of_measurement: "gal/min"
+    accuracy_decimals: 3
+    state_class: measurement
+  - platform: template
+    name: "BY Meter RSSI"
+    id: by_rssi
+    unit_of_measurement: "dBm"
+    accuracy_decimals: 0
+    device_class: signal_strength
+    entity_category: diagnostic
+
+# Pure passive listening -- no ble_client, no connection, no write handshake,
+# no pre-declared per-meter config. active: false since we only need the
+# primary advertisement's Service Data, not a scan response.
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            // --- identify: is this one of our meters? ---
+            char addr_buf[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
+            std::string addr = x.address_str_to(addr_buf);
+            for (auto &c : addr) c = toupper(c);
+            if (addr.substr(0, 11) != "${meter_mac_prefix}") return;
+
+            // --- find the custom service data payload ---
+            const std::vector<uint8_t> *payload = nullptr;
+            for (auto &sd : x.get_service_datas()) {
+              if (sd.uuid == esphome::esp32_ble_tracker::ESPBTUUID::from_uint32(${meter_service_uuid})) {
+                payload = &sd.data;
+                break;
+              }
+            }
+            if (payload == nullptr || payload->size() < 15) return;
+            auto &d = *payload;
+            size_t n = d.size();
+            auto u32 = [&](size_t i){
+              return (uint32_t)d[i] | ((uint32_t)d[i+1]<<8) |
+                     ((uint32_t)d[i+2]<<16) | ((uint32_t)d[i+3]<<24);
+            };
+
+            // --- build the "XXYY" topic prefix from the last two MAC bytes ---
+            std::string suffix = addr.substr(12, 2) + addr.substr(15, 2);
+            uint16_t suffix_key = (uint16_t) strtoul(suffix.c_str(), nullptr, 16);
+
+            // --- decode fields, anchored from the END of the payload rather than a
+            // fixed offset from the start. Confirmed via capture: the meter sometimes
+            // inserts an extra byte earlier in the payload (25 bytes instead of the
+            // usual 24), which silently misaligned fixed-offset parsing and produced
+            // wildly-inflated garbage values (traced to the same 784587/12625587
+            // figures from an earlier bug report -- turned out to never be bad meter
+            // data, just misparsed good data). The trailing 15 bytes are always three
+            // fixed (1-byte marker + 4-byte LE value) blocks regardless of what
+            // variable-length prefix precedes them, so anchoring from the end and
+            // validating the marker bytes handles this (and any similar future
+            // anomaly) robustly instead of guessing at a fixed prefix length.
+            if (d[n-15] != 0x9f || d[n-10] != 0xcb || d[n-5] != 0xb3) return;  // unexpected layout -- skip
+            uint32_t last_session = u32(n - 14);
+            uint32_t total_today  = u32(n - 9);
+            uint32_t total_usage  = u32(n - 4);
+            int rssi = x.get_rssi();
+            const float GAL_PER_COUNT = 0.0264172f;  // 1 raw count = 0.1 L, confirmed against app readings
+
+            // --- liveness: update on every advertisement ---
+            MeterState *st = get_meter_state(suffix_key);
+            if (st == nullptr) return;  // table full -- more than 8 distinct meters seen
+
+            uint32_t now = millis();
+            st->last_seen_millis = now;
+            st->last_rssi = rssi;
+
+            // --- reject implausible readings. Originally added on the theory that the
+            // meter broadcasts genuinely bad data -- that theory turned out to be wrong
+            // (see the anchored-from-end parsing fix above, which addresses the real
+            // cause). Kept as cheap defense-in-depth against any other not-yet-
+            // understood anomaly, since it costs nothing when readings are normal. ---
+            const float MAX_PLAUSIBLE_GPM = 15.0f;
+            bool first_sighting = (st->last_change_millis == 0);
+            if (!first_sighting) {
+              if (total_usage < st->last_counter) return;  // counter went backwards -- reject
+              uint32_t inst_dt_ms = now - st->last_change_millis;
+              if (inst_dt_ms > 0) {
+                float inst_delta_gal = (total_usage - st->last_counter) * GAL_PER_COUNT;
+                float inst_gpm = inst_delta_gal / (inst_dt_ms / 60000.0f);
+                // generous multiple of MAX_PLAUSIBLE_GPM here on purpose: at ~1Hz
+                // sampling of a coarse ~0.026 gal/tick counter, genuine instantaneous
+                // per-sample rates naturally swing well above the true average by
+                // chance alone (see the windowed average below for the real signal) --
+                // this check exists only to catch actual corruption, not real noise.
+                if (inst_gpm > MAX_PLAUSIBLE_GPM * 3) return;
+              }
+            }
+
+            // --- flow rate: averaged over a rolling window, not computed between
+            // consecutive samples. The meter's counter is coarse and updates on a
+            // cadence close to our own sampling rate, so an instantaneous per-sample
+            // delta swings on sampling phase alone (confirmed: alternates between
+            // roughly half and double the true rate). Averaging over ~15s smooths
+            // this out while staying reasonably responsive. total_today/total_usage/
+            // last_session/rssi are unaffected by this and still publish at full rate. ---
+            const uint32_t RATE_WINDOW_MS = 15000;
+            if (first_sighting) {
+              st->rate_anchor_counter = total_usage;
+              st->rate_anchor_millis = now;
+            }
+            uint32_t window_ms = now - st->rate_anchor_millis;
+            if (window_ms >= RATE_WINDOW_MS) {
+              float delta_gal = (total_usage - st->rate_anchor_counter) * GAL_PER_COUNT;
+              float dt_min = window_ms / 60000.0f;
+              st->last_flow_rate = delta_gal / dt_min;
+              st->rate_anchor_counter = total_usage;
+              st->rate_anchor_millis = now;
+            }
+
+            st->last_counter = total_usage;
+            st->last_change_millis = now;
+
+            char json_buf[192];
+            snprintf(json_buf, sizeof(json_buf),
+              "{\"total_today\":%.2f,\"total_usage\":%.2f,\"last_session_usage\":%.2f,"
+              "\"rssi\":%d,\"flow_rate\":%.3f}",
+              total_today * GAL_PER_COUNT, total_usage * GAL_PER_COUNT,
+              last_session * GAL_PER_COUNT, rssi, st->last_flow_rate);
+            id(mqtt_client)->publish("flowmeter/" + suffix, std::string(json_buf));
+            id(flash_mqtt_activity)->execute();
+
+            // --- Home Assistant path: also feed the declared sensor: entities for
+            // known meters (see the big comment above the sensor: section for how
+            // to extend this to your own meter). Same already-computed values,
+            // just handed to a second output -- nothing above this point changes. ---
+            if (suffix == "7E31") {
+              id(fy_total_today)->publish_state(total_today * GAL_PER_COUNT);
+              id(fy_total_usage)->publish_state(total_usage * GAL_PER_COUNT);
+              id(fy_last_session_usage)->publish_state(last_session * GAL_PER_COUNT);
+              id(fy_flow_rate)->publish_state(st->last_flow_rate);
+              id(fy_rssi)->publish_state(rssi);
+            } else if (suffix == "855E") {
+              id(by_total_today)->publish_state(total_today * GAL_PER_COUNT);
+              id(by_total_usage)->publish_state(total_usage * GAL_PER_COUNT);
+              id(by_last_session_usage)->publish_state(last_session * GAL_PER_COUNT);
+              id(by_flow_rate)->publish_state(st->last_flow_rate);
+              id(by_rssi)->publish_state(rssi);
+            }
+
+# Periodic heartbeat, decoupled entirely from whether the gallon data has
+# changed -- publishes RSSI + time-since-last-advertisement for every meter
+# currently in the table. This is what makes "meter went quiet" detectable
+# on a short timescale even during a 23-hour gap between waterings.
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          for (auto &s : meter_states) {
+            if (!s.used) continue;
+            char suffix[5];
+            snprintf(suffix, sizeof(suffix), "%04X", s.mac_suffix);
+            uint32_t seconds_since = (now - s.last_seen_millis) / 1000;
+            char json_buf[96];
+            snprintf(json_buf, sizeof(json_buf),
+              "{\"rssi\":%d,\"seconds_since_advert\":%u}",
+              s.last_rssi, (unsigned) seconds_since);
+            id(mqtt_client)->publish(std::string("flowmeter/") + suffix + "/heartbeat", std::string(json_buf));
+          }
