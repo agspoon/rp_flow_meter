@@ -4,7 +4,8 @@ Local, cloud-free monitoring for the [RainPoint HCS048B Smart Bluetooth Water Fl
 
 No app, no cloud account, no connection to the meter at all — this reads the meter's own passive BLE advertisements directly.
 
-![RainPoint HCS048B installed inline ahead of a B-hyve irrigation controller, showing 0.0 GAL/Min on its display while idle](images/RP_Flow_Meter.jpg)
+<img src="images/RP_Flow_Meter.jpg" width=30% alt="RainPoint water meter with Orbit controller">
+
 *A real installation: the meter sits inline between the hose bib and a B-hyve controller, giving whole-system flow monitoring regardless of which zone is running — the same data this project reads over BLE instead of the meter's own tiny screen.*
 
 ## Table of Contents
@@ -44,10 +45,6 @@ Each meter advertises a custom 32-bit BLE Service UUID (`0x011b9191`) carrying a
 
 The meter advertises roughly once per second. Because its own counter only ticks in those coarse 0.0264-gallon steps, computing a flow rate from consecutive individual samples is noisy by nature (some 1-second windows catch one tick, others catch two, by pure timing luck) — this project averages flow rate over a rolling ~15-second window rather than per-sample, which produces a stable reading.
 
-### No GATT connection needed
-
-An earlier iteration of this project connected via GATT and wrote a specific byte sequence to trigger live notifications — this worked, but required timing around the RainPoint app's own connections and added real complexity. All of that is gone from the current design; the advertisement alone carries everything needed for cumulative totals, last-session usage, and (with light averaging) flow rate.
-
 ## Hardware
 
 **Any BLE5-capable ESP32 (S3 recommended)** works. This project has run on both:
@@ -57,7 +54,9 @@ An earlier iteration of this project connected via GATT and wrote a specific byt
   - [2.4GHz dipole antenna, RP-SMA, 5dBi](https://www.adafruit.com/product/945)
   - [RP-SMA to w.FL/MHF3/IPEX3 adapter cable](https://www.adafruit.com/product/5444) — **note the connector spec carefully**: this board uses w.FL/MHF3/IPEX3, which is a different (if confusingly similar-looking) connector family from the more common u.FL — the wrong adapter won't physically mate correctly.
 
-ESPHome board id for the Feather: `adafruit_feather_esp32s3_nopsram`.
+  - ESPHome board id for the Feather: `adafruit_feather_esp32s3_nopsram`.
+
+<img src="images/RP_Flow_ESP32.jpg" width=30% alt="Adafruit ESP32-S3 Feather">
 
 ### Status LEDs (Adafruit Feather only)
 
@@ -65,8 +64,6 @@ If using the Feather board, this config drives its two onboard LEDs for at-a-gla
 
 - **NeoPixel** (GPIO33 data, GPIO21 power-enable — the power pin must be driven high or the LED does nothing): green when WiFi is connected, red when it isn't.
 - **Plain red LED** (GPIO13, `LED_BUILTIN`): brief flash on every MQTT flow-data publish, as an activity indicator.
-
-Both pin assignments are taken from the board's own Arduino variant definition, not guessed.
 
 ## Repository contents
 
@@ -87,7 +84,8 @@ Both pin assignments are taken from the board's own Arduino variant definition, 
 
 This config doesn't hardcode meter addresses for its core scanning logic — it matches any BLE advertiser whose MAC starts with `meter_mac_prefix` (set in `substitutions:`) and carries the expected `meter_service_uuid`. If your HCS048B (or a meter from the same product line) shares that prefix, it's picked up automatically, with no config changes, the moment it's in range.
 
-**Finding your meter's specific address**, without touching BLE at all: once this is running, it's already publishing to a topic named after each meter's own MAC suffix. Capture your WiFi traffic in Wireshark (or a saved `.pcapng`) and apply this display filter:
+**Finding your meter's specific address**, without touching BLE at all: once this is running, it's already publishing to a topic named after each meter's own MAC suffix. The entire BLE MAC address is available from the RainPoint App, under "Device Information" for the meter of interest.
+Or you can capture your WiFi traffic in Wireshark (or a saved `.pcapng`) and apply this display filter:
 
 ```
 mqtt.msgtype == 3 and mqtt.topic contains "flowmeter/"
@@ -131,6 +129,7 @@ services:
   mqtt-exporter:
     image: kpetrem/mqtt-exporter
     ports:
+      # use the port number where you want the metrics published (match to Prometheus config below)
       - "9000:9000"
     environment:
       - MQTT_ADDRESS=<your-broker-ip>
@@ -149,6 +148,7 @@ The exporter's default topic-to-label behavior folds the *entire* topic path int
 scrape_configs:
   - job_name: mqtt-exporter
     static_configs:
+      # use the port number where the metrics are published
       - targets: ["mqtt-exporter:9000"]
     metric_relabel_configs:
       - source_labels: [meter]
@@ -171,21 +171,18 @@ If you don't use Home Assistant yourself but want this to be easy for someone wh
 - The raw JSON topics above work for Prometheus/mqtt-exporter regardless of what else is listening.
 - A small, separately-declared block of `sensor:` entities (search `RP_flow.yaml` for "Home Assistant") mirrors the same already-computed values into standard ESPHome entities with real `name:` fields — which is what makes them eligible for Home Assistant's automatic MQTT discovery. No `api:` component, and nothing for the HA user to configure by hand; the entities just appear.
 
-**The trade-off**: unlike the raw JSON side, this part isn't automatically generic — it's pre-populated for the two meters this project was built against. To add your own meter to this section specifically, see the walkthrough comment directly above the `sensor:` block in `RP_flow.yaml`, which covers finding your meter's suffix (same Wireshark method as above) and wiring it into both the entity declarations and the small dispatch block in the BLE lambda that routes decoded values to the right entities.
+**The trade-off**: unlike the raw JSON side, this part isn't automatically generic — it's pre-populated for the two meters this project was built against. To add your own meter to this section specifically, see the walkthrough comment directly above the `sensor:` block in `RP_flow.yaml`, which covers finding your meter's suffix, and wiring it into both the entity declarations and the small dispatch block in the BLE lambda that routes decoded values to the right entities.
 
 ## Known limitations
 
 - **Flow rate is a ~15s rolling average, not instantaneous.** This is a deliberate response to the meter's own coarse counter resolution, not a limitation of the code — see [How it works](#how-it-works).
-- **Variable-length advertisement payload.** The meter occasionally includes one extra byte earlier in its Service Data payload. Parsing is anchored from the *end* of the payload specifically to be robust to this (and any similar future variation), rather than assuming a fixed total length.
+- **Variable-length advertisement payload.** The meter occasionally includes one extra byte earlier in its Service Data payload. Could be a bug in the firmware. Parsing is anchored from the *end* of the payload specifically to be robust to this (and any similar future variation), rather than assuming a fixed total length.
 - **A single ESP32's BLE reception quality matters.** Weak RSSI (below roughly -80dBm) increases the chance of missed advertisements. If a meter is marginal from one location, an external-antenna board (see [Hardware](#hardware)) or a second node covering that area both work — multiple nodes can listen to the same meter with no conflict.
 - **This relies on undocumented behavior of the meter's own firmware.** RainPoint could change the advertisement format in a future firmware update, which would require re-verifying the byte layout above against a fresh capture.
 
 ## How this was reverse engineered
 
-For anyone adapting this to a different meter, or just curious: the byte layout above wasn't guessed — it was derived from packet captures with Wireshark (`bluetooth-monitor` interface on Linux, via BlueZ, plus a dedicated nRF52840 dongle running Nordic's sniffer firmware for cross-checking) correlated against the RainPoint app's own displayed readings across controlled flow tests of known duration. Two things worth knowing if you're doing this yourself:
-
-- **A GATT-based approach was tried first** — connecting and writing a specific byte sequence to trigger live notifications — and worked, but turned out to be solving a harder problem than necessary once the passive advertisement was found to carry the same data with no connection at all.
-- **BlueZ's own scan-restart behavior can masquerade as the device's real advertising interval.** An early measurement of "the meter advertises every ~15-17 seconds" turned out to be an artifact of the capture host's scanning software restarting on a fixed cycle, not the meter's actual behavior (closer to ~1Hz). If you're independently verifying a device's advertising interval, check for suspiciously exact, jitter-free periodicity in your own capture tooling before trusting it as ground truth.
+For anyone adapting this to a different meter, or just curious: the byte layout was derived from packet captures with Wireshark (`bluetooth-monitor` interface on Linux, via BlueZ, plus a dedicated nRF52840 dongle running Nordic's sniffer firmware for cross-checking) correlated against the RainPoint app's own displayed readings across controlled flow tests of known duration.
 
 ## Disclaimer
 
